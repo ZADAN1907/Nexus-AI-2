@@ -30,26 +30,44 @@ export default async function handler(req, res) {
   const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
 
-  let geminiRes;
-  try {
-    geminiRes = await fetch(url, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey
-      },
-      body: JSON.stringify(body)
-    });
-  } catch (e) {
-    res.status(502).json({ error: { message: "Gemini API'ye ulaşılamadı: " + (e?.message || 'ağ hatası') } });
-    return;
-  }
+  // Gemini bazen "model aşırı yüklü" anlamına gelen 503 (bazen 429) döner.
+  // Bu geçici bir durumdur; birkaç kez, artan bekleme süreleriyle tekrar deneriz.
+  const MAX_ATTEMPTS = 3;
+  let geminiRes, data;
 
-  const data = await geminiRes.json().catch(() => null);
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      geminiRes = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey
+        },
+        body: JSON.stringify(body)
+      });
+    } catch (e) {
+      if (attempt === MAX_ATTEMPTS) {
+        res.status(502).json({ error: { message: "Gemini API'ye ulaşılamadı: " + (e?.message || 'ağ hatası') } });
+        return;
+      }
+      await new Promise(r => setTimeout(r, 500 * attempt));
+      continue;
+    }
 
-  if (!geminiRes.ok) {
+    if (geminiRes.ok) {
+      data = await geminiRes.json().catch(() => null);
+      break;
+    }
+
+    const retryable = geminiRes.status === 503 || geminiRes.status === 429;
+    if (retryable && attempt < MAX_ATTEMPTS) {
+      await new Promise(r => setTimeout(r, 700 * attempt)); // 700ms, 1400ms...
+      continue;
+    }
+
+    data = await geminiRes.json().catch(() => null);
     res.status(geminiRes.status).json(
-      data || { error: { message: 'Gemini API hatası (HTTP ' + geminiRes.status + ')' } }
+      data || { error: { message: 'Gemini API hatası (HTTP ' + geminiRes.status + '). Model şu an aşırı yüklü olabilir, birazdan tekrar deneyin.' } }
     );
     return;
   }
