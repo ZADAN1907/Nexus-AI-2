@@ -2241,273 +2241,31 @@ FILE ANALYSIS: When the user uploads a PDF, Word (.docx), PowerPoint (.pptx), Ex
                 return fetch(url, { ...(init || {}), signal: controller.signal }).finally(() => clearTimeout(timeoutId));
             }
 
-            function decodeHtmlEntities(str) {
-                const ta = document.createElement('textarea');
-                ta.innerHTML = str;
-                return ta.value;
-            }
-
-            function normalizeUrlKey(url) {
-                try {
-                    const u = new URL(url);
-                    return (u.hostname + u.pathname).replace(/\/$/, '').toLowerCase();
-                } catch (e) { return url; }
-            }
-
-            function dedupeResults(list) {
-                const seen = new Set();
-                const out = [];
-                for (const r of list) {
-                    if (!r.url || !r.title) continue;
-                    const key = normalizeUrlKey(r.url);
-                    if (seen.has(key)) continue;
-                    seen.add(key);
-                    out.push(r);
-                }
-                return out;
-            }
-
-            // Tek bir CORS proxy üzerinden bir arama motorunun HTML sonuç sayfasını çekip
-            // verilen CSS seçicilerle organik sonuçları ayrıştırır.
-            async function scrapeEngineViaProxy(proxyUrl, parseFn, timeoutMs) {
-                const r = await fetchWithTimeout(proxyUrl, timeoutMs);
-                if (!r.ok) throw new Error('proxy http ' + r.status);
-                const html = await r.text();
-                if (!html || html.length < 200) throw new Error('boş yanıt');
-                const doc = new DOMParser().parseFromString(html, 'text/html');
-                return parseFn(doc);
-            }
-
-            function parseDuckDuckGoHtml(doc) {
-                const out = [];
-                doc.querySelectorAll('.result__body').forEach(item => {
-                    if (out.length >= 6) return;
-                    const titleEl = item.querySelector('.result__a');
-                    const snippetEl = item.querySelector('.result__snippet');
-                    if (titleEl && titleEl.getAttribute('href')) {
-                        let url = titleEl.getAttribute('href');
-                        try {
-                            const u = new URL(url, 'https://duckduckgo.com');
-                            const real = u.searchParams.get('uddg');
-                            if (real) url = decodeURIComponent(real);
-                        } catch (e) {}
-                        out.push({
-                            title: decodeHtmlEntities((titleEl.textContent || 'Kaynak').trim()).substring(0, 100),
-                            url,
-                            snippet: decodeHtmlEntities((snippetEl?.textContent || '').trim()).substring(0, 320),
-                            source: 'DuckDuckGo'
-                        });
-                    }
-                });
-                return out;
-            }
-
-            function parseBingHtml(doc) {
-                const out = [];
-                doc.querySelectorAll('#b_results > li.b_algo').forEach(item => {
-                    if (out.length >= 6) return;
-                    const titleEl = item.querySelector('h2 a');
-                    const snippetEl = item.querySelector('.b_caption p, .b_snippet, .b_algoSlug');
-                    if (titleEl && titleEl.getAttribute('href')) {
-                        out.push({
-                            title: decodeHtmlEntities((titleEl.textContent || 'Kaynak').trim()).substring(0, 100),
-                            url: titleEl.getAttribute('href'),
-                            snippet: decodeHtmlEntities((snippetEl?.textContent || '').trim()).substring(0, 320),
-                            source: 'Bing'
-                        });
-                    }
-                });
-                return out;
-            }
-
-            // Aynı arama motoru için birden fazla ücretsiz CORS proxy'sini AYNI ANDA dener;
-            // hangisi ilk cevap verirse onu kullanır. Böylece tek bir proxy'nin yavaş/kapalı
-            // olması tüm aramayı yavaşlatmaz.
-            function raceProxies(targetUrl, parseFn, timeoutMs) {
-                const proxies = [
-                    'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(targetUrl),
-                    'https://api.allorigins.win/raw?url=' + encodeURIComponent(targetUrl),
-                    'https://corsproxy.io/?url=' + encodeURIComponent(targetUrl)
-                ];
-                const attempts = proxies.map(p => scrapeEngineViaProxy(p, parseFn, timeoutMs).then(results => {
-                    if (!results || results.length === 0) throw new Error('sonuç yok');
-                    return results;
-                }));
-                return Promise.any(attempts);
-            }
-
-            // ---------- SEARXNG ENTEGRASYONU ----------
-            // SearXNG (github.com/searxng/searxng): açık kaynak, kendi kendine barındırılan
-            // meta-arama motoru. Tek seferde Google, Bing, DuckDuckGo, Brave, Startpage, Qwant
-            // gibi ~243 farklı arama servisini AYNI ANDA tarayıp sonuçları birleştirir/temizler.
-            // Burada, herkese açık halka açık SearXNG örnekleri (public instance) üzerinden
-            // JSON API'si kullanılıyor — yani Nexus AI artık kendi başına birkaç motoru elle
-            // kazımak yerine, GitHub'daki bu hazır ve gelişmiş sistemi doğrudan kullanıyor.
-            const SEARXNG_INSTANCES = [
-                'https://searx.bndkt.io',
-                'https://search.im-in.space',
-                'https://search.indst.eu',
-                'https://ooglester.com',
-                'https://search.hbubli.cc',
-                'https://metacat.online',
-                'https://search.canine.tools',
-                'https://nyc1.sx.ggtyler.dev'
-            ];
-
-            function parseSearXNGJson(data) {
-                return (data?.results || []).slice(0, 8).map(r => ({
-                    title: decodeHtmlEntities((r.title || 'Kaynak').trim()).substring(0, 100),
-                    url: r.url,
-                    snippet: decodeHtmlEntities((r.content || '').trim()).substring(0, 320),
-                    source: 'SearXNG' + (r.engine ? ` (${r.engine})` : '')
-                })).filter(r => r.url && r.title);
-            }
-
-            async function searchSearXNG(query, timeoutMs) {
-                const q = encodeURIComponent(query);
-
-                // 1) Önce örneklere DOĞRUDAN bağlanmayı dene (bazı örnekler CORS'a izin verir, en hızlısı).
-                const directAttempts = SEARXNG_INSTANCES.map(base =>
-                    fetchWithTimeout(`${base}/search?q=${q}&format=json&language=auto`, timeoutMs).then(async r => {
-                        if (!r.ok) throw new Error('http ' + r.status);
-                        const ct = r.headers.get('content-type') || '';
-                        if (!ct.includes('json')) throw new Error('json değil (bu örnekte format=json kapalı)');
-                        const results = parseSearXNGJson(await r.json());
-                        if (results.length === 0) throw new Error('sonuç yok');
-                        return results;
-                    })
-                );
-                try { return await Promise.any(directAttempts); } catch (e) { /* doğrudan erişim başarısız, proxy'ye geç */ }
-
-                // 2) Doğrudan erişim CORS nedeniyle engellendiyse, birkaç örneği CORS proxy üzerinden dene.
-                const proxiedAttempts = SEARXNG_INSTANCES.slice(0, 4).map(base => {
-                    const target = `${base}/search?q=${q}&format=json&language=auto`;
-                    const proxyUrl = 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(target);
-                    return fetchWithTimeout(proxyUrl, timeoutMs).then(async r => {
-                        if (!r.ok) throw new Error('http ' + r.status);
-                        const text = await r.text();
-                        let data;
-                        try { data = JSON.parse(text); } catch (e) { throw new Error('json ayrıştırılamadı'); }
-                        const results = parseSearXNGJson(data);
-                        if (results.length === 0) throw new Error('sonuç yok');
-                        return results;
-                    });
-                });
-                try { return await Promise.any(proxiedAttempts); } catch (e) { return []; }
-            }
-
-            // GitHub genel arama API'si — depo (repository) arar. Kimlik doğrulama gerektirmez
-            // (dakikada ~10 istek sınırı vardır, bu yüzden hataları sessizce yutuyoruz).
-            async function searchGitHub(query, timeoutMs) {
-                try {
-                    const r = await fetchWithTimeout(
-                        'https://api.github.com/search/repositories?q=' + encodeURIComponent(query) + '&sort=stars&order=desc&per_page=4',
-                        timeoutMs,
-                        { headers: { 'Accept': 'application/vnd.github+json' } }
-                    );
-                    if (!r.ok) return [];
-                    const data = await r.json();
-                    return (data.items || []).map(repo => ({
-                        title: repo.full_name + (repo.stargazers_count ? ` ⭐${repo.stargazers_count}` : ''),
-                        url: repo.html_url,
-                        snippet: decodeHtmlEntities(repo.description || 'Açıklama yok').substring(0, 300) + (repo.language ? ` [${repo.language}]` : ''),
-                        source: 'GitHub'
-                    }));
-                } catch (e) { return []; }
-            }
-
-            // Bir sayfanın HTML'ini proxy üzerinden çekip gövde metnini (nav/script/style/footer
-            // hariç) çıkarır. "Araştırmacı modu": sadece kısa snippet değil, gerçek sayfa içeriğini okur.
-
-            function extractMainText(doc) {
-                doc.querySelectorAll('script, style, nav, header, footer, aside, noscript, svg, form, iframe').forEach(el => el.remove());
-                const candidates = ['article', 'main', '[role="main"]', '.article-content', '.post-content', '#content', 'body'];
-                let node = null;
-                for (const sel of candidates) { node = doc.querySelector(sel); if (node && node.textContent && node.textContent.trim().length > 200) break; }
-                if (!node) node = doc.body;
-                const text = (node?.textContent || '').replace(/[ \t]+/g, ' ').replace(/\n\s*\n+/g, '\n').trim();
-                return text;
-            }
-
-            async function fetchPageFullText(url, timeoutMs) {
-                const proxies = [
-                    'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(url),
-                    'https://api.allorigins.win/raw?url=' + encodeURIComponent(url),
-                    'https://corsproxy.io/?url=' + encodeURIComponent(url)
-                ];
-                const attempts = proxies.map(p => fetchWithTimeout(p, timeoutMs).then(async r => {
-                    if (!r.ok) throw new Error('http ' + r.status);
-                    const html = await r.text();
-                    if (!html || html.length < 200) throw new Error('boş');
-                    const doc = new DOMParser().parseFromString(html, 'text/html');
-                    const text = extractMainText(doc);
-                    if (!text || text.length < 150) throw new Error('içerik yok');
-                    return text.substring(0, 4000);
-                }));
-                return Promise.any(attempts);
-            }
-
+            // ---------- WEB ARAMA (sunucu tarafı /api/search üzerinden) ----------
+            // Eskiden burada tarayıcıdan doğrudan SearXNG/DuckDuckGo/Bing'e ve ücretsiz
+            // CORS proxy'lerine (corsproxy.io, allorigins vb.) bağlanılıyordu; bunlar
+            // sürekli kapanıp CORS/DNS hatası veriyordu. Artık tüm bu iş /api/search.js
+            // içinde SUNUCU tarafında yapılıyor (CORS tarayıcıya özgü olduğu için orada
+            // sorun çıkmıyor); burada sadece tek bir istek atılıyor.
             async function performWebSearch(query) {
                 if (!webSearchEnabled) return null;
-                const q = encodeURIComponent(query);
-                const wikiLang = userSettings.language === 'tr' ? 'tr' : 'en';
-                const TIMEOUT = 8000;
-
-                // AŞAMA 1 — GENİŞ TARAMA: birden fazla kaynağı (SearXNG meta-arama motoru,
-                // DuckDuckGo, Bing, Wikipedia, DDG Instant Answer, GitHub) AYNI ANDA sorgula;
-                // bir araştırmacının önce birden fazla kaynaktan ön bilgi toplaması gibi.
-                const tasks = [
-                    searchSearXNG(query, TIMEOUT).catch(() => []),
-                    raceProxies('https://html.duckduckgo.com/html/?q=' + q, parseDuckDuckGoHtml, TIMEOUT)
-                        .catch(() => []),
-                    raceProxies('https://www.bing.com/search?q=' + q + '&setlang=' + wikiLang, parseBingHtml, TIMEOUT)
-                        .catch(() => []),
-                    fetchWithTimeout(`https://${wikiLang}.wikipedia.org/w/api.php?action=query&list=search&srsearch=${q}&format=json&origin=*&srlimit=3`, TIMEOUT)
-                        .then(r => r.ok ? r.json() : null)
-                        .then(wd => (wd?.query?.search || []).map(s => ({
-                            title: s.title,
-                            url: `https://${wikiLang}.wikipedia.org/wiki/${encodeURIComponent(s.title.replace(/ /g, '_'))}`,
-                            snippet: decodeHtmlEntities((s.snippet || '').replace(/<[^>]+>/g, '')).substring(0, 320),
-                            source: 'Wikipedia'
-                        })))
-                        .catch(() => []),
-                    fetchWithTimeout(`https://api.duckduckgo.com/?q=${q}&format=json&t=nexusai&no_html=1`, TIMEOUT)
-                        .then(r => r.ok ? r.json() : null)
-                        .then(data => {
-                            if (!data) return [];
-                            const out = [];
-                            if (data.AbstractText?.length > 50) out.push({ title: data.Heading || 'Özet', url: data.AbstractURL || `https://duckduckgo.com/?q=${q}`, snippet: data.AbstractText.substring(0, 300), source: 'DuckDuckGo' });
-                            (data.RelatedTopics || []).slice(0, 3).forEach(t => {
-                                if (t.Text && t.FirstURL) out.push({ title: t.Text.split(' - ')[0]?.substring(0, 60) || 'Kaynak', url: t.FirstURL, snippet: t.Text.substring(0, 250), source: 'DuckDuckGo' });
-                            });
-                            return out;
-                        })
-                        .catch(() => []),
-                    searchGitHub(query, TIMEOUT)
-                ];
-
-                const settled = await Promise.all(tasks);
-                const [searxngRes, ddgRes, bingRes, wikiRes, ddgIaRes, githubRes] = settled;
-                // Kaliteye göre sırala: SearXNG (birçok motoru zaten birleştiriyor) ve organik
-                // sonuçlar (DDG/Bing) önce, sonra GitHub, sonra Wikipedia/Instant Answer.
-                let results = dedupeResults([...searxngRes, ...ddgRes, ...bingRes, ...githubRes, ...wikiRes, ...ddgIaRes]);
-
-                if (results.length === 0) {
-                    return [{ title: 'Arama sonucu bulunamadı', url: `https://duckduckgo.com/?q=${q}`, snippet: `"${query}" için arama motorunda sonuçları görüntülemek üzere tıklayın.`, source: '—' }];
+                const TIMEOUT = 15000;
+                try {
+                    const res = await fetchWithTimeout(
+                        API_BASE + '/api/search',
+                        TIMEOUT,
+                        {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ query, language: userSettings.language, deepRead: true })
+                        }
+                    );
+                    if (!res.ok) throw new Error('http ' + res.status);
+                    const data = await res.json();
+                    return data?.results || [];
+                } catch (e) {
+                    return [{ title: 'Arama sonucu bulunamadı', url: `https://duckduckgo.com/?q=${encodeURIComponent(query)}`, snippet: `"${query}" için arama motorunda sonuçları görüntülemek üzere tıklayın.`, source: '—' }];
                 }
-                results = results.slice(0, 8);
-
-                // AŞAMA 2 — DERİNLEMESİNE OKUMA: en alakalı organik sonuçların (SearXNG/DDG/Bing/GitHub)
-                // tam sayfa metnini çekmeye çalış; sadece kısa özet değil, gerçek kaynak içeriği.
-                // Bir insan araştırmacının linke tıklayıp sayfayı okuması gibi davranır.
-                const deepReadCandidates = results.filter(r => (r.source || '').startsWith('SearXNG') || r.source === 'DuckDuckGo' || r.source === 'Bing' || r.source === 'GitHub').slice(0, 3);
-                await Promise.all(deepReadCandidates.map(async r => {
-                    try {
-                        r.fullText = await fetchPageFullText(r.url, 9000);
-                    } catch (e) { /* tam metin alınamadı, snippet ile devam */ }
-                }));
-
-                return results;
             }
 
             function displaySearchingNotice() {
