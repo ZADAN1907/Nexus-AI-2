@@ -25,14 +25,16 @@ export default async function handler(req, res) {
     return;
   }
 
-  // Frontend'de tanımlı olmayan / artık aktif olmayan modeller gelirse
-  // sessizce güncel bir Groq modeline düş.
+  // Groq, llama-3.3-70b-versatile ve llama-3.1-8b-instant modellerini
+  // 17 Haziran 2026'da kullanımdan kaldırdı (bkz. console.groq.com/docs/deprecations).
+  // Frontend'de eski/artık geçersiz bir model adı gelirse sessizce güncel
+  // bir Groq modeline düş.
   const ALLOWED_MODELS = new Set([
-    'llama-3.3-70b-versatile',
-    'llama-3.1-8b-instant',
-    'mixtral-8x7b-32768'
+    'openai/gpt-oss-120b',
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.6-27b'
   ]);
-  const safeModel = ALLOWED_MODELS.has(model) ? model : 'llama-3.3-70b-versatile';
+  const safeModel = ALLOWED_MODELS.has(model) ? model : 'openai/gpt-oss-120b';
 
   let groqRes;
   try {
