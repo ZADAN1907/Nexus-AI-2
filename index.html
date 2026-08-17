@@ -2673,6 +2673,9 @@ FILE ANALYSIS: When the user uploads a PDF, Word (.docx), PowerPoint (.pptx), Ex
                 if (!res.ok) {
                     let msg = 'HTTP ' + res.status;
                     try { const errData = await res.json(); msg = errData?.error?.message || msg; } catch (e) {}
+                    if (res.status === 503 || res.status === 429) {
+                        msg = 'Gemini şu an aşırı yüklü, birazdan tekrar deneyin.';
+                    }
                     throw new Error('Gemini görsel analizi başarısız: ' + msg);
                 }
                 const data = await res.json();
