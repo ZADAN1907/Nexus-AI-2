@@ -1,3 +1,4 @@
+
 // /api/vision.js
 // Nexus AI frontend'i görsel yüklendiğinde bu endpoint'e zaten tam
 // Gemini formatında bir istek atıyor: { contents: [{ parts: [...] }] }
@@ -28,7 +29,13 @@ export default async function handler(req, res) {
   // "latest" takma adı Google tarafından en güncel stabil sürüme otomatik
   // yönlendirilir; model kaldırılır/değişirse GEMINI_MODEL env var'ı ile override edilebilir.
   const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+  // NOT: Google, Haziran 2026'dan itibaren yeni üretilen key'leri eski
+  // "AIza..." formatından yeni "AQ...." (Auth key) formatına geçirdi.
+  // Bu yeni key'ler x-goog-api-key HEADER'ı ile gönderildiğinde bazı
+  // hesaplarda 401 ACCESS_TOKEN_TYPE_UNSUPPORTED hatası veriyor
+  // (bilinen, Google tarafı bir sorun). Key'i header yerine ?key=
+  // query param olarak göndermek bu durumda daha güvenilir çalışıyor.
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
 
   // Gemini bazen "model aşırı yüklü" anlamına gelen 503 (bazen 429) döner.
   // Bu geçici bir durumdur; birkaç kez, artan bekleme süreleriyle tekrar deneriz.
@@ -40,8 +47,7 @@ export default async function handler(req, res) {
       geminiRes = await fetch(url, {
         method: 'POST',
         headers: {
-          'Content-Type': 'application/json',
-          'x-goog-api-key': apiKey
+          'Content-Type': 'application/json'
         },
         body: JSON.stringify(body)
       });
