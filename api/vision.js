@@ -1,10 +1,13 @@
-
 // /api/vision.js
-// Nexus AI frontend'i görsel yüklendiğinde bu endpoint'e zaten tam
-// Gemini formatında bir istek atıyor: { contents: [{ parts: [...] }] }
-// ve aynı formatta bir cevap bekliyor. Burada tek iş: isteği API key'i
-// EKLEYEREK gerçek Gemini API'sine iletmek. Anahtar sadece bu sunucu
-// tarafı kodda kalır, tarayıcıya hiç gönderilmez.
+// Nexus AI frontend'i görsel yüklendiğinde bu endpoint'e Gemini formatında
+// bir istek atıyor: { contents: [{ parts: [...] }] } ve aynı formatta
+// ({ candidates: [{ content: { parts: [{ text }] } }] }) bir cevap bekliyor.
+//
+// Gemini API sürekli hata verdiği (503/429/ACCESS_TOKEN_TYPE_UNSUPPORTED vb.)
+// için görsel analizi artık GROQ'un multimodal (vision) modeline yapılıyor.
+// Frontend HİÇ değişmedi: burada tek iş, gelen Gemini-şekilli isteği Groq'un
+// OpenAI-uyumlu chat/completions formatına çevirmek, Groq'a atmak ve dönen
+// cevabı tekrar Gemini şekline sarıp frontend'e iletmek.
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -12,73 +15,99 @@ export default async function handler(req, res) {
     return;
   }
 
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     res.status(500).json({
-      error: { message: 'GEMINI_API_KEY ortam değişkeni ayarlanmamış. Vercel > Project Settings > Environment Variables kısmından ekleyin.' }
+      error: { message: 'GROQ_API_KEY ortam değişkeni ayarlanmamış. Vercel > Project Settings > Environment Variables kısmından ekleyin.' }
     });
     return;
   }
 
   const body = req.body;
-  if (!body?.contents?.[0]?.parts) {
+  const parts = body?.contents?.[0]?.parts;
+  if (!Array.isArray(parts)) {
     res.status(400).json({ error: { message: 'Geçersiz istek gövdesi (contents[0].parts bekleniyordu).' } });
     return;
   }
 
-  // "latest" takma adı Google tarafından en güncel stabil sürüme otomatik
-  // yönlendirilir; model kaldırılır/değişirse GEMINI_MODEL env var'ı ile override edilebilir.
-  const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-  // NOT: Google, Haziran 2026'dan itibaren yeni üretilen key'leri eski
-  // "AIza..." formatından yeni "AQ...." (Auth key) formatına geçirdi.
-  // Bu yeni key'ler x-goog-api-key HEADER'ı ile gönderildiğinde bazı
-  // hesaplarda 401 ACCESS_TOKEN_TYPE_UNSUPPORTED hatası veriyor
-  // (bilinen, Google tarafı bir sorun). Key'i header yerine ?key=
-  // query param olarak göndermek bu durumda daha güvenilir çalışıyor.
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const imagePart = parts.find(p => p?.inline_data?.data);
+  const textPart = parts.find(p => typeof p?.text === 'string');
 
-  // Gemini bazen "model aşırı yüklü" anlamına gelen 503 (bazen 429) döner.
-  // Bu geçici bir durumdur; birkaç kez, artan bekleme süreleriyle tekrar deneriz.
-  const MAX_ATTEMPTS = 3;
-  let geminiRes, data;
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      geminiRes = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify(body)
-      });
-    } catch (e) {
-      if (attempt === MAX_ATTEMPTS) {
-        res.status(502).json({ error: { message: "Gemini API'ye ulaşılamadı: " + (e?.message || 'ağ hatası') } });
-        return;
-      }
-      await new Promise(r => setTimeout(r, 500 * attempt));
-      continue;
-    }
-
-    if (geminiRes.ok) {
-      data = await geminiRes.json().catch(() => null);
-      break;
-    }
-
-    const retryable = geminiRes.status === 503 || geminiRes.status === 429;
-    if (retryable && attempt < MAX_ATTEMPTS) {
-      await new Promise(r => setTimeout(r, 700 * attempt)); // 700ms, 1400ms...
-      continue;
-    }
-
-    data = await geminiRes.json().catch(() => null);
-    res.status(geminiRes.status).json(
-      data || { error: { message: 'Gemini API hatası (HTTP ' + geminiRes.status + '). Model şu an aşırı yüklü olabilir, birazdan tekrar deneyin.' } }
-    );
+  if (!imagePart) {
+    res.status(400).json({ error: { message: 'Görsel verisi bulunamadı (inline_data.data bekleniyordu).' } });
     return;
   }
 
-  // Gemini'nin cevabı zaten frontend'in beklediği şekilde
-  // ({ candidates: [{ content: { parts: [{ text }] } }] }) — olduğu gibi ilet.
-  res.status(200).json(data);
+  const mimeType = imagePart.inline_data.mime_type || 'image/jpeg';
+  const base64 = imagePart.inline_data.data;
+  const promptText = textPart?.text || 'Bu görseli Türkçe olarak ayrıntılı biçimde analiz et.';
+
+  // Groq'un vision destekleyen modelleri. Birincisi kota/limit ya da
+  // deprecation nedeniyle hata verirse ikincisine düşülür.
+  const VISION_MODELS = [
+    process.env.GROQ_VISION_MODEL,
+    'meta-llama/llama-4-scout-17b-16e-instruct',
+    'meta-llama/llama-4-maverick-17b-128e-instruct'
+  ].filter(Boolean);
+
+  const groqBody = {
+    messages: [
+      {
+        role: 'user',
+        content: [
+          { type: 'text', text: promptText },
+          { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}` } }
+        ]
+      }
+    ],
+    temperature: 0.4,
+    max_tokens: 2048
+  };
+
+  let lastErr = null;
+
+  for (const model of VISION_MODELS) {
+    let groqRes;
+    try {
+      groqRes = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${apiKey}`
+        },
+        body: JSON.stringify({ ...groqBody, model })
+      });
+    } catch (e) {
+      lastErr = "Groq API'ye ulaşılamadı: " + (e?.message || 'ağ hatası');
+      continue;
+    }
+
+    if (!groqRes.ok) {
+      let detail = '';
+      try { detail = (await groqRes.json())?.error?.message || ''; } catch (_) {}
+      lastErr = `Groq görsel analizi başarısız (${model}, HTTP ${groqRes.status})${detail ? ': ' + detail : ''}`;
+      // Model kaldırılmış/geçersizse ya da aşırı yüklüyse sıradaki modele geç.
+      if ([400, 404, 429, 503].includes(groqRes.status)) continue;
+      break;
+    }
+
+    const data = await groqRes.json().catch(() => null);
+    const text = data?.choices?.[0]?.message?.content;
+    if (!text) {
+      lastErr = `Groq boş yanıt döndürdü (${model}).`;
+      continue;
+    }
+
+    // Frontend'in beklediği Gemini-şekilli cevap.
+    res.status(200).json({
+      candidates: [
+        { content: { parts: [{ text }] } }
+      ]
+    });
+    return;
+  }
+
+  res.status(502).json({
+    error: { message: lastErr || 'Görsel analiz edilemedi.' }
+  });
 }
