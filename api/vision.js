@@ -42,12 +42,16 @@ export default async function handler(req, res) {
   const base64 = imagePart.inline_data.data;
   const promptText = textPart?.text || 'Bu görseli Türkçe olarak ayrıntılı biçimde analiz et.';
 
-  // Groq'un vision destekleyen modelleri. Birincisi kota/limit ya da
-  // deprecation nedeniyle hata verirse ikincisine düşülür.
+  // Groq'un vision destekleyen modelleri.
+  // NOT: meta-llama/llama-4-scout-17b-16e-instruct ve
+  // meta-llama/llama-4-maverick-17b-128e-instruct Groq tarafından 2026'da
+  // kullanımdan kaldırıldı (deprecated) -> artık HTTP 404 dönüyorlar.
+  // Güncel (2026) vision-capable model: qwen/qwen3.6-27b.
+  // Birincisi hata verirse (kota/limit/deprecation) ikincisine düşülür.
   const VISION_MODELS = [
     process.env.GROQ_VISION_MODEL,
-    'meta-llama/llama-4-scout-17b-16e-instruct',
-    'meta-llama/llama-4-maverick-17b-128e-instruct'
+    'qwen/qwen3.6-27b',
+    'meta-llama/llama-4-scout-17b-16e-instruct'
   ].filter(Boolean);
 
   const groqBody = {
@@ -61,7 +65,7 @@ export default async function handler(req, res) {
       }
     ],
     temperature: 0.4,
-    max_tokens: 2048
+    max_completion_tokens: 2048
   };
 
   let lastErr = null;
